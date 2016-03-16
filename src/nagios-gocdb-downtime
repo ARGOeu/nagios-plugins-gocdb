@@ -1,0 +1,370 @@
+#!/usr/bin/perl -w
+#
+# Nagios GOCDB downtime importer
+# Copyright (c) 2007 Emir Imamagic
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#
+# Changes and Modifications
+# =========================
+#
+# 16-Dec-2009 - 1.1 Migrated to Apache 2.0 license
+
+use strict;
+use Nagios::Plugin;
+use GridMon::Nagios;
+use GridMon::Nagios::Downtimes;
+use LWP::UserAgent;
+use XML::DOM;
+use Date::Format;
+use GridMon::Nagios qw(nagios_debug);
+use No::Worries::Syslog qw(syslog_open);
+
+$SIG{__WARN__} = \&No::Worries::Warn::handler;
+$SIG{__DIE__}  = \&No::Worries::Die::handler;
+
+syslog_open(ident => "nagios-gocdb-downtime", facility => "user");
+nagios_debug("started");
+
+# Standard variables used in Nagios::Plugin constructor
+my $PROGNAME = 'nagios-gocdb-downtime';
+my $VERSION = '1.1';
+my $DESCRIPTION = 'Nagios GOCDB downtime importer.';
+my $EXTRA_DESC = "
+  Examples:
+    # Get downtimes for a single site:
+    $PROGNAME --entity egee.srce.hr
+
+    # Get downtimes for a roc:
+    $PROGNAME --entity CentralEurope
+";
+my $LICENSE = 'This nagios plugin is free software, and comes with ABSOLUTELY NO WARRANTY.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+   http://www.apache.org/licenses/LICENSE-2.0
+Copyright 2009 Emir Imamagic';
+my $SHORTNAME = 'GOCDB_DOWNTIMES';
+
+# Other variables used in parames etc
+my $DEFAULT_GOCDB_ROOT_URL = "https://goc.egi.eu/gocdbpi";
+my $GOCDB_GET_METHOD = "/public/?method=get_downtime";
+
+sub getGOCDBDowntimes {
+    my $plugin = shift;
+    my $gocdbDowntimes = shift;
+    my $entity = shift;
+
+    my $ua = LWP::UserAgent->new(env_proxy=>1);
+    $ua->agent($PROGNAME);
+    my $url = $plugin->opts->get('gocdb-root-url') . $GOCDB_GET_METHOD . '&topentity=' . $entity . '&windowstart=' . time2str("%Y-%m-%d",time(),'UTC');
+
+    print "Fetching information from address: $url\n" if ( $plugin->opts->verbose );
+    
+    my $req = HTTP::Request->new(GET => $url);
+    my $res = $ua->request($req);
+    if (!$res->is_success) {
+        $plugin->nagios_exit(CRITICAL, "Could not get results from GOCDB: ".$res->status_line);
+    }
+    
+    my $parser = new XML::DOM::Parser(ErrorContext => 2);
+    my $doc;
+    eval {
+        $doc = $parser->parse($res->content);
+    };
+    if ($@) {
+        $plugin->nagios_exit(CRITICAL, "Error parsing XML response: ".$@);
+    }
+
+    foreach my $site ($doc->getElementsByTagName("error_message")) {
+        my $value = $site->getFirstChild();
+        $value = $value->getNodeValue() if ($value);
+        $plugin->nagios_exit(CRITICAL, "GOCDB error: $value");
+    }
+
+    foreach my $site ($doc->getElementsByTagName("DOWNTIME")) {
+        my $elem;
+        my $id = $site->getAttribute("ID");
+        my $shouldSkip;
+
+        print "Found downtime: $id\n" if ( $plugin->opts->verbose );
+
+        foreach $elem ($site->getElementsByTagName("SEVERITY")) {
+            my $value = $elem->getFirstChild();
+            $value = $value->getNodeValue() if ($value);
+            if ($value && ($value eq "AT_RISK" || $value eq "WARNING")) {
+                print "    SEVERITY: $value\n" if ( $plugin->opts->verbose );
+                print "Downtime $id has severity $value, skipping it.\n" if ( $plugin->opts->verbose );
+                $shouldSkip = 1;
+            }
+        }
+        if ($shouldSkip) {
+            next;
+        }
+
+        foreach $elem ($site->getElementsByTagName("DESCRIPTION")) {
+            my $value = $elem->getFirstChild();
+            $value = $value->getNodeValue() if ($value);
+            if ($value) {
+                print "    DESCRIPTION: $value\n" if ( $plugin->opts->verbose );
+                $gocdbDowntimes->{$id}->{DESCRIPTION}=$value;
+            }
+        }
+    
+        foreach $elem ($site->getElementsByTagName("START_DATE")) {
+            my $value = $elem->getFirstChild();
+            $value = $value->getNodeValue() if ($value);
+            if ($value) {
+                print "    START_DATE: $value\n" if ( $plugin->opts->verbose );
+                $gocdbDowntimes->{$id}->{START_DATE}=$value;
+            }
+        }
+    
+        foreach $elem ($site->getElementsByTagName("END_DATE")) {
+            my $value = $elem->getFirstChild();
+            $value = $value->getNodeValue() if ($value);
+            if ($value) {
+                print "    END_DATE: $value\n" if ( $plugin->opts->verbose );
+                $gocdbDowntimes->{$id}->{END_DATE}=$value;
+            }
+        }
+    
+        foreach $elem ($site->getElementsByTagName("SITENAME")) {
+            my $value = $elem->getFirstChild();
+            $value = $value->getNodeValue() if ($value);
+            if ($value) {
+                print "    SITENAME: $value\n" if ( $plugin->opts->verbose );
+                $gocdbDowntimes->{$id}->{SITENAME}=$value;
+            }
+        }
+        
+        foreach $elem ($site->getElementsByTagName("HOSTNAME")) {
+            my $value = $elem->getFirstChild();
+            $value = $value->getNodeValue() if ($value);
+            if ($value) {
+                print "    HOSTNAME: $value\n" if ( $plugin->opts->verbose );
+                $gocdbDowntimes->{$id}->{HOSTNAMES}->{$value}=1;
+            }
+        }
+    }
+    $doc->dispose;
+}
+
+# Create Nagios::Plugin instance
+my $plugin = Nagios::Plugin->new (usage => "Usage: %s --entity <sitename|rocname>",
+                                  shortname => $SHORTNAME,
+                                  version => $VERSION,
+                                  blurb => $DESCRIPTION,
+                                  extra => $EXTRA_DESC,
+                                  license => $LICENSE,
+                                  plugin  => $PROGNAME);
+# Define additional arguments
+$plugin->add_arg(
+    spec => 'gocdb-root-url=s',
+    help => "--gocdb-root-url\n   GOCDB XML interface root URL.\n   (default: $DEFAULT_GOCDB_ROOT_URL)",
+    required => 0,
+    default => $DEFAULT_GOCDB_ROOT_URL
+);
+
+$plugin->add_arg(
+    spec => 'entity=s',
+    help => "--entity\n   Name of site or ROC for which downtimes will be gathered.",
+    required => 1
+);
+
+$plugin->getopts;
+
+local $SIG{ALRM} = sub {
+    $plugin->nagios_die("Timeout while fetching results.");
+};
+
+local $SIG{TERM} = sub {
+    $plugin->nagios_die("Plugin received TERM signal.");
+};
+
+my $gocdbDowntimes = {};
+my $newDowntimes = 0;
+my $alteredDowntimes = 0;
+my $removedDowtimes = 0;
+my $nagios;
+my $hostFilter = {};
+
+alarm $plugin->opts->timeout;
+
+my ($nagMaint, $error) = GridMon::Nagios::Downtimes->new();
+
+if (!$nagMaint) {
+    alarm 0;
+    $plugin->nagios_exit(CRITICAL, "Cannot get Nagios downtime data: ".$error);
+}
+
+if (!($nagios = GridMon::Nagios->new($plugin->opts->get('nagios-cfg')))) {
+    alarm(0);
+    $plugin->nagios_exit(CRITICAL, "Error creating GridMon::Nagios object.");
+}
+
+if (!$nagios->fetchConfHostData(['_site_name'])) {
+    alarm(0);
+    $plugin->nagios_exit(CRITICAL, "Couldn't fetch Nagios host config. Error: " . $nagios->{ERROR});
+}
+
+my @entities = split (/,/, $plugin->opts->entity);
+foreach my $entity (@entities) {
+    getGOCDBDowntimes $plugin, $gocdbDowntimes, $entity;
+}
+
+if (!$nagMaint->fetchDowntimeData) {
+    alarm 0;
+    $plugin->nagios_exit(CRITICAL, $nagMaint->{ERROR});
+}
+
+foreach my $down (keys %$gocdbDowntimes) {
+    my $downRef = $gocdbDowntimes->{$down};
+
+    # downtime has already been imported
+    # check if admin has changed start/end time
+    if ($nagMaint->existsMaint($down)) {
+    
+        #
+        my $hasChanged = 1;
+
+        # let's check if hosts on site have changed
+        if (exists $downRef->{SITENAME}) {
+            $hostFilter->{_site_name} = $downRef->{SITENAME};
+            if (!$nagios->filterHosts($hostFilter, 1)) {
+                alarm(0);
+                $plugin->nagios_exit(CRITICAL, "Couldn't filter Nagios hosts based on _site_name. Error: " . $nagios->{ERROR});
+            }
+            my @arrNagios = keys %{$nagios->{HOSTS}};
+            my @arrMaint = $nagMaint->getMaintHosts($down);
+            my %join = ();
+            my $compare = 0;
+            foreach my $element (@arrNagios, @arrMaint) { 
+                $join{$element}++;
+            }
+            foreach my $element (keys %join) {
+                if ($join{$element} != 2) {
+                    $compare = 1;
+                    last;
+                }
+            }
+            $nagios->clearFilter();
+            # arrays are different, recreate downtime
+            if ($compare) {
+                print "Hosts of site $downRef->{SITENAME} changed, updating downtime $down (desc: $downRef->{DESCRIPTION}).\n" if ( $plugin->opts->verbose );
+                if (!$nagMaint->removeDowntimeByMaint($down)) {
+                    alarm 0;
+                    $plugin->nagios_exit(CRITICAL, $nagMaint->{ERROR});
+                }
+                if (!$nagMaint->addDowntime( { start_time => $downRef->{START_DATE},
+                                      end_time => $downRef->{END_DATE},
+                                      comment => $downRef->{DESCRIPTION},
+                                      maintID => $down,
+                                      author => 'nagiosadmin',
+                                      hostname => 'site-'.$downRef->{SITENAME}}, 1)){
+                    alarm 0;
+                    $plugin->nagios_exit(CRITICAL, $nagMaint->{ERROR});
+                }
+                $alteredDowntimes++;
+                next;
+            }
+        }
+
+        # iterate trough all hosts affected with downtime
+        foreach my $hostname ($nagMaint->getMaintHosts($down)) {
+            my $nagDown = $nagMaint->getMaintHostDowntime($down, $hostname);
+            # admin has changed start/end time
+            if ($nagDown->{start_time} != $downRef->{START_DATE} || $nagDown->{end_time} != $downRef->{END_DATE} ) {
+                print "Downtime $down (desc: $downRef->{DESCRIPTION}) on host $hostname has been modified.\n" if ( $plugin->opts->verbose );
+                if (!$nagMaint->removeDowntime($nagDown->{downtime_id})) {
+                    alarm 0;
+                    $plugin->nagios_exit(CRITICAL, $nagMaint->{ERROR});
+                }
+                if (exists $downRef->{HOSTNAMES}->{$hostname}) {
+                    if (!$nagMaint->addDowntime( { start_time => $downRef->{START_DATE},
+                                              end_time => $downRef->{END_DATE},
+                                              comment => $downRef->{DESCRIPTION},
+                                              maintID => $down,
+                                              author => 'nagiosadmin',
+                                              hostname => $hostname}) ){
+                        alarm 0;
+                        $plugin->nagios_exit(CRITICAL, $nagMaint->{ERROR});
+                    }
+                } else {
+                    print "Downtime $down (desc: $downRef->{DESCRIPTION}) on non-GOC DB host $hostname NOT RECREATED.\n" if ( $plugin->opts->verbose );
+                }
+            }
+            # time hasn't been changed, stop iterating over hosts
+            else {
+                $hasChanged = 0;
+                last;
+            }
+        }
+        $alteredDowntimes++ if ($hasChanged);
+    } else {
+        # check if the downtime has expired
+        if ($downRef->{END_DATE} < time()) {
+            next;
+        } 
+        $newDowntimes++;
+        print "Adding downtime $down (desc: $downRef->{DESCRIPTION})\n" if ( $plugin->opts->verbose );
+        # this is a site level downtime
+        if (exists $downRef->{SITENAME}) {
+            print "  site: $downRef->{SITENAME}.\n" if ( $plugin->opts->verbose );
+            if (!$nagMaint->addDowntime( { start_time => $downRef->{START_DATE},
+                                      end_time => $downRef->{END_DATE},
+                                      comment => $downRef->{DESCRIPTION},
+                                      maintID => $down,
+                                      author => 'nagiosadmin',
+                                      hostname => 'site-'.$downRef->{SITENAME}}, 1)){
+                alarm 0;
+                $plugin->nagios_exit(CRITICAL, $nagMaint->{ERROR});
+            }
+        }
+        # this is a node level downtime
+        elsif (exists $downRef->{HOSTNAMES}) {
+            foreach my $hostname (keys %{$downRef->{HOSTNAMES}}) {
+                print "  host: $hostname.\n" if ( $plugin->opts->verbose );
+                if (!$nagMaint->addDowntime( { start_time => $downRef->{START_DATE},
+                                          end_time => $downRef->{END_DATE},
+                                          comment => $downRef->{DESCRIPTION},
+                                          maintID => $down,
+                                          author => 'nagiosadmin',
+                                          hostname => $hostname})) {
+                    alarm 0;
+                    $plugin->nagios_exit(CRITICAL, $nagMaint->{ERROR});
+                }
+            }
+        }
+    }
+}
+
+foreach my $nagMaintID ($nagMaint->getMaints) {
+    if (! exists $gocdbDowntimes->{$nagMaintID}) {
+        $removedDowtimes++;
+        if (!$nagMaint->removeDowntimeByMaint($nagMaintID)) {
+            alarm 0;
+            $plugin->nagios_exit(CRITICAL, $nagMaint->{ERROR});
+        }
+    }
+}
+
+alarm 0;
+
+$plugin->add_perfdata( label => "new", value => $newDowntimes);
+$plugin->add_perfdata( label => "modified", value => $alteredDowntimes);
+$plugin->add_perfdata( label => "deleted", value => $removedDowtimes);
+
+$plugin->nagios_exit(OK, "Downtimes successfully synchronized.");
+
