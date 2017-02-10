@@ -1,4 +1,4 @@
-%define dir /usr/libexec/argo-monitoring/probes/fedcloud
+%define dir /usr/libexec/argo-monitoring/probes/gocdb
 
 Summary: Nagios plugins for EGI GOCDB
 Name: nagios-plugins-gocdb
