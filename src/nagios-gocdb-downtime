@@ -66,7 +66,7 @@ sub getGOCDBDowntimes {
     my $gocdbDowntimes = shift;
     my $entity = shift;
 
-    my $ua = LWP::UserAgent->new(env_proxy=>1);
+    my $ua = LWP::UserAgent->new(env_proxy=>1, ssl_opts => { SSL_ca_path => '/etc/grid-security/certificates' });
     $ua->agent($PROGNAME);
     my $url = $plugin->opts->get('gocdb-root-url') . $GOCDB_GET_METHOD . '&topentity=' . $entity . '&windowstart=' . time2str("%Y-%m-%d",time(),'UTC');
 
